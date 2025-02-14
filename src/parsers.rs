@@ -52,6 +52,16 @@ pub(crate) async fn parse_cron_reminder(
         None
     } else {
         let cron_expr = cron_fields.join(" ");
+        let content = text
+            .strip_prefix(&(cron_expr.to_owned()))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let mut parts = content.split('/');
+
+        let desc = parts.nth(0).unwrap_or("");
+        let index = parts.next().unwrap_or("").parse::<i64>().unwrap_or(0);
+
         parse_cron(&cron_expr, &Utc::now().with_timezone(&user_timezone))
             .map(|time| cron_reminder::ActiveModel {
                 id: NotSet,
@@ -59,11 +69,8 @@ pub(crate) async fn parse_cron_reminder(
                 user_id: Set(Some(user_id as i64)),
                 cron_expr: Set(cron_expr.clone()),
                 time: Set(time.with_timezone(&Utc).naive_utc()),
-                desc: Set(text
-                    .strip_prefix(&(cron_expr.to_owned()))
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned()),
+                max_index: Set(index),
+                desc: Set(desc.to_string()),
                 paused: Set(false),
                 msg_id: Set(Some(msg_id)),
                 reply_id: Set(None), // set after replying

@@ -11,6 +11,7 @@ pub struct Model {
     pub chat_id: i64,
     pub cron_expr: String,
     pub time: NaiveDateTime,
+    pub max_index: i64,
     pub desc: String,
     pub user_id: Option<i64>,
     pub paused: bool,

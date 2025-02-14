@@ -3263,6 +3263,7 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 name = "remindee-bot"
 version = "0.2.10"
 dependencies = [
+ "anyhow",
  "async-std",
  "bitmask-enum",
  "chrono",
@@ -3280,6 +3281,7 @@ dependencies = [
  "pest_derive",
  "pretty_env_logger",
  "regex",
+ "reqwest 0.11.27",
  "sea-orm",
  "sea-orm-migration",
  "serde",

@@ -5,7 +5,7 @@ use crate::db::Database;
 use crate::db::MockDatabase as Database;
 use crate::entity::{cron_reminder, reminder};
 use crate::err::Error;
-use crate::format;
+use crate::{format, vieon};
 use crate::handlers::{get_handler, Command, State};
 use crate::parsers::now_time;
 use crate::serializers::Pattern;
@@ -18,10 +18,13 @@ use sea_orm::{ActiveValue::NotSet, IntoActiveModel};
 use serde_json::{from_str, to_string};
 use std::cmp::max;
 use std::sync::Arc;
+use std::time::Duration;
+use sea_orm::ActiveValue::Set;
 use teloxide::dispatching::dialogue::serializer::Json;
 use teloxide::dispatching::dialogue::{ErasedStorage, SqliteStorage, Storage};
 use teloxide::{prelude::*, utils::command::BotCommands};
-use tokio::time::Instant;
+use teloxide::types::InputFile;
+use tokio::time::{sleep, Instant};
 
 async fn send_reminder(
     reminder: &reminder::Model,
@@ -38,21 +41,41 @@ async fn send_reminder(
         .map_err(From::from)
 }
 
+fn escape_telegram_markdown(text: &str) -> String {
+    text.replace('.', r"\.")
+        .replace('?', r"\?")
+        .replace('!', r"\!")
+        .replace('-', r"\-")
+}
+
 async fn send_cron_reminder(
     reminder: &cron_reminder::Model,
     next_reminder: Option<&cron_reminder::Model>,
+    name: String,
+    image: String,
     user_timezone: Tz,
     bot: &Bot,
 ) -> Result<(), Error> {
-    let text =
-        format::format_cron_reminder(reminder, next_reminder, user_timezone);
+    if let Ok(c) = image.parse() {
+        bot.send_photo(ChatId(reminder.chat_id), InputFile::url(c))
+            .await
+            .map_err::<Error, _>(From::from)?;
+    }
+
+    let text = format!(
+        "*{}*\n{}",
+        escape_telegram_markdown(&name),
+        format::format_cron_reminder(reminder, next_reminder, user_timezone)
+    );
+
+
     send_message(&text, bot, ChatId(reminder.chat_id))
         .await
         .map(|_| ())
         .map_err(From::from)
 }
 
-async fn process_due_reminders(db: &Database, bot: &Bot) {
+async fn process_due_reminders(db: Arc<Database>, bot: &Bot) {
     let reminders = db
         .get_active_reminders()
         .await
@@ -60,7 +83,7 @@ async fn process_due_reminders(db: &Database, bot: &Bot) {
     for reminder in reminders {
         if let Some(user_id) = reminder.user_id.map(|x| UserId(x as u64)) {
             if let Ok(Some(user_timezone)) =
-                get_user_timezone(db, user_id).await
+                get_user_timezone(&db, user_id).await
             {
                 let mut next_reminder = None;
                 if let Some(ref serialized) = reminder.pattern {
@@ -102,7 +125,7 @@ async fn process_due_reminders(db: &Database, bot: &Bot) {
     for cron_reminder in cron_reminders {
         if let Some(user_id) = cron_reminder.user_id.map(|x| UserId(x as u64)) {
             if let Ok(Some(user_timezone)) =
-                get_user_timezone(db, user_id).await
+                get_user_timezone(&db, user_id).await
             {
                 let new_time = parse_cron(
                     &cron_reminder.cron_expr,
@@ -119,38 +142,88 @@ async fn process_due_reminders(db: &Database, bot: &Bot) {
                         None
                     }
                 };
-                match send_cron_reminder(
-                    &cron_reminder,
-                    new_cron_reminder.as_ref(),
-                    user_timezone,
-                    bot,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        db.delete_cron_reminder(cron_reminder.id)
-                            .await
-                            .unwrap_or_else(|err| {
-                                log::error!("{}", err);
-                            });
-                        if let Some(new_cron_reminder) = new_cron_reminder {
-                            let mut new_cron_reminder: cron_reminder::ActiveModel = new_cron_reminder.into();
-                            new_cron_reminder.id = NotSet;
-                            db.insert_cron_reminder(new_cron_reminder)
-                                .await
-                                .map(|_| ())
-                                .unwrap_or_else(|err| {
-                                    log::error!("{}", err);
-                                });
-                        }
-                    }
-                    Err(err) => {
+                db.delete_cron_reminder(cron_reminder.id)
+                    .await
+                    .unwrap_or_else(|err| {
                         log::error!("{}", err);
-                    }
-                }
+                    });
+                tokio::spawn(check_and_send_cron_reminder(
+                    db.clone(),
+                    bot.clone(),
+                    cron_reminder.clone(),
+                    new_cron_reminder,
+                    user_timezone,
+                ));
+                log::info!("Spawned a new task for cron reminder");
             }
         }
     }
+}
+
+
+async fn check_and_send_cron_reminder(
+    db: Arc<Database>,
+    bot: Bot,
+    cron_reminder: cron_reminder::Model,
+    new_cron_reminder: Option<cron_reminder::Model>,
+    user_timezone: Tz,
+) {
+    const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+    const MAX_DURATION: Duration = Duration::from_secs(120);
+
+    log::info!("Starting cron reminder check for reminder ID: {}", cron_reminder.id);
+
+    let start_time = tokio::time::Instant::now();
+
+    while start_time.elapsed() < MAX_DURATION {
+        log::debug!("Elapsed time: {:?}", start_time.elapsed());
+
+        match vieon::get_source_list(&cron_reminder.desc).await {
+            Ok(data) => {
+
+                let (name, image) = data.get_info();
+
+                if data.metadata.total > cron_reminder.max_index {
+                    if let Err(err) = send_cron_reminder(
+                        &cron_reminder,
+                        new_cron_reminder.as_ref(),
+                        name,
+                        image,
+                        user_timezone,
+                        &bot,
+                    )
+                        .await
+                    {
+                        log::error!("Failed to send cron reminder: {}", err);
+                    }
+                    handle_new_cron_reminder(&db, &new_cron_reminder, data.metadata.total).await;
+                    return;
+                }
+            }
+            Err(err) => log::error!("Failed to get source list: {}", err),
+        }
+
+        sleep(CHECK_INTERVAL).await;
+    }
+
+    log::info!("Timeout reached after {:?}", MAX_DURATION);
+}
+
+async fn handle_new_cron_reminder(db: &Arc<Database>, new_cron_reminder: &Option<cron_reminder::Model>, new_index: i64) {
+    if let Some(reminder) = new_cron_reminder {
+        if let Err(err) = insert_new_reminder(db, reminder.clone(), new_index).await {
+            log::error!("Failed to insert new cron reminder: {}", err);
+        }
+    }
+}
+
+
+async fn insert_new_reminder(db: &Database, reminder: cron_reminder::Model, new_index: i64) -> Result<cron_reminder::ActiveModel, crate::db::Error> {
+    let mut active_reminder: cron_reminder::ActiveModel = reminder.into();
+    active_reminder.id = NotSet;
+    active_reminder.max_index = Set(new_index);
+
+    db.insert_cron_reminder(active_reminder).await
 }
 
 async fn deadline_from_datetime(dt: NaiveDateTime) -> Instant {
@@ -184,7 +257,7 @@ async fn poll_reminders(db: Arc<Database>, bot: Bot) {
                 next_deadline.as_mut().reset(get_next_reminder_time().await);
             }
             () = &mut next_deadline => {
-                process_due_reminders(&db, &bot).await;
+                process_due_reminders(db.clone(), &bot).await;
 
                 next_deadline.as_mut().reset(get_next_reminder_time().await);
             }

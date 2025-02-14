@@ -38,6 +38,9 @@ impl MigrationTrait for Migration {
                         ColumnDef::new(CronReminder::Sent).boolean().not_null(),
                     )
                     .col(
+                        ColumnDef::new(CronReminder::MaxIndex).integer().not_null().default(1),
+                    )
+                    .col(
                         ColumnDef::new(CronReminder::Edit).boolean().not_null(),
                     )
                     .to_owned(),
@@ -62,4 +65,5 @@ pub enum CronReminder {
     Desc,
     Sent,
     Edit,
+    MaxIndex,
 }
